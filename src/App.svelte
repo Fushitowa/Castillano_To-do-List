@@ -1,5 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
+  import { supabase, taskFromRow, taskToRow } from './lib/supabase.js';
 
   const storageKey = 'daylist-tasks-v1';
   const noteColors = ['yellow', 'mint', 'rose', 'peach', 'sky', 'lilac'];
@@ -15,8 +16,10 @@
   const hours = Array.from({ length: 12 }, (_, index) => String(index + 1).padStart(2, '0'));
   const minutes = Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0'));
   let tasks = $state([]);
-  let filter = $state('wall');
+  let filter = $state('today');
   let searchQuery = $state('');
+  let colorFilter = $state('');
+  let selectedTaskId = $state('');
   let theme = $state('sage');
   let themePickerOpen = $state(false);
   let modalOpen = $state(false);
@@ -34,46 +37,115 @@
   let paperDialog = $state(null);
   let modalReturnFocus = $state(null);
   let ready = $state(false);
+  let localOnly = $state(false);
   let reminderPermission = $state('unsupported');
   let reminderQueue = $state([]);
   let currentTime = $state(Date.now());
+  let authUser = $state(null);
+  let authError = $state('');
+  let authSubscription;
+  let activeUserId = null;
 
-  onMount(() => {
+  function readLegacyTasks() {
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) || '[]');
-      if (Array.isArray(saved)) {
-        tasks = saved.filter((task) => task && typeof task.id === 'string' && typeof task.title === 'string')
-          .map((task) => ({
-            id: task.id,
-            title: task.title,
-            done: Boolean(task.done),
-            createdAt: Number(task.createdAt) || Date.now(),
-            dueAt: typeof task.dueAt === 'string' && Number.isFinite(new Date(task.dueAt).getTime()) ? task.dueAt : '',
-            reminded: Boolean(task.reminded),
-            notes: typeof task.notes === 'string' ? task.notes : '',
-            color: noteColors.includes(task.color) ? task.color : '',
-          }));
-      }
+      if (!Array.isArray(saved)) return [];
+      return saved.filter((task) => task && typeof task.id === 'string' && typeof task.title === 'string')
+        .map((task) => ({
+          id: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(task.id) ? task.id : crypto.randomUUID(),
+          title: task.title.trim().slice(0, 160),
+          done: Boolean(task.done),
+          createdAt: Number.isFinite(Number(task.createdAt)) && Number(task.createdAt) > 0 ? Number(task.createdAt) : Date.now(),
+          dueAt: typeof task.dueAt === 'string' && Number.isFinite(new Date(task.dueAt).getTime()) ? task.dueAt : '',
+          reminded: Boolean(task.reminded),
+          notes: typeof task.notes === 'string' ? task.notes : '',
+          color: noteColors.includes(task.color) ? task.color : '',
+        })).filter((task) => task.title);
     } catch {
-      tasks = [];
+      return [];
     }
+  }
+
+  async function loadUserTasks(user) {
+    if (!supabase || !user) return;
+    activeUserId = user.id;
+    ready = false;
+    reminderQueue = [];
+    const { data, error } = await supabase.from('tasks').select('*').order('created_at', { ascending: false });
+    if (activeUserId !== user.id) return;
+    if (error) {
+      authError = `Cloud sync is unavailable: ${error.message}`;
+      localOnly = true;
+      tasks = readLegacyTasks();
+      ready = true;
+      return;
+    }
+    localOnly = false;
+    let rows = data ?? [];
+    const legacyTasks = readLegacyTasks();
+    if (legacyTasks.length) {
+      const { data: imported, error: importError } = await supabase.from('tasks')
+        .upsert(legacyTasks.map((task) => taskToRow(task, user.id))).select('*');
+      if (activeUserId !== user.id) return;
+      if (importError) authError = `Tasks loaded, but browser-saved tasks could not be imported: ${importError.message}`;
+      else {
+        const importedIds = new Set((imported ?? []).map((task) => task.id));
+        rows = [...rows.filter((task) => !importedIds.has(task.id)), ...(imported ?? [])];
+        try { localStorage.removeItem(storageKey); } catch { /* Imported tasks are safely stored remotely. */ }
+      }
+    }
+    tasks = rows.map(taskFromRow);
+    ready = true;
+    currentTime = Date.now();
+    checkReminders();
+  }
+
+  onMount(async () => {
+    tasks = readLegacyTasks();
+    localOnly = true;
+    ready = true;
     try {
       const savedTheme = localStorage.getItem(themeStorageKey);
       if (workspaceThemes.some((option) => option.id === savedTheme)) theme = savedTheme;
     } catch { /* Theme preferences may be unavailable in private browsing. */ }
     if ('Notification' in window) reminderPermission = Notification.permission;
-    ready = true;
-    checkReminders();
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        authUser = data.session?.user ?? null;
+      } catch { authUser = null; }
+      if (!authUser) {
+        try {
+          const { data, error } = await supabase.auth.signInAnonymously();
+          if (error) throw error;
+          authUser = data.user;
+        } catch { localOnly = true; }
+      }
+      if (authUser) await loadUserTasks(authUser);
+      else { tasks = readLegacyTasks(); ready = true; }
+      const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+        const nextUser = session?.user ?? null;
+        authUser = nextUser;
+        if (nextUser) { authError = ''; localOnly = false; void loadUserTasks(nextUser); }
+        else { activeUserId = null; localOnly = true; tasks = readLegacyTasks(); ready = true; reminderQueue = []; }
+      });
+      authSubscription = data.subscription;
+    } else {
+      localOnly = true;
+      tasks = readLegacyTasks();
+      ready = true;
+    }
     const timer = window.setInterval(() => {
       currentTime = Date.now();
       checkReminders();
     }, 15000);
-    return () => window.clearInterval(timer);
+    return () => { window.clearInterval(timer); authSubscription?.unsubscribe(); };
   });
 
   $effect(() => {
-    if (ready) {
-      try { localStorage.setItem(storageKey, JSON.stringify(tasks)); } catch { /* Storage may be unavailable. */ }
+    if (ready && localOnly) {
+      try { localStorage.setItem(storageKey, JSON.stringify(tasks)); } catch { /* Local storage may be unavailable. */ }
     }
   });
 
@@ -92,26 +164,42 @@
     const matchesFilter = (filter === 'wall' && !task.done)
       || (filter === 'today' && !task.done && !isUpcoming(task) && !isMissed(task))
       || (filter === 'upcoming' && isUpcoming(task))
+      || (filter === 'calendar' && !task.done && Boolean(task.dueAt))
       || (filter === 'missed' && isMissed(task))
       || (filter === 'completed' && task.done);
-    return matchesFilter && task.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
+    const matchesColor = !colorFilter || noteColor(task, tasks.indexOf(task)) === colorFilter;
+    return matchesFilter && matchesColor && task.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
   }));
+  let selectedTask = $derived(visibleTasks.find((task) => task.id === selectedTaskId) ?? visibleTasks[0] ?? null);
+  let viewTitle = $derived(filter === 'today' ? 'Today' : filter === 'upcoming' ? 'Upcoming' : filter === 'calendar' ? 'Calendar' : filter === 'missed' ? 'Missed' : filter === 'completed' ? 'Completed' : 'Sticky Wall');
   let upcomingCount = $derived(tasks.filter(isUpcoming).length);
   let todayCount = $derived(tasks.filter((task) => !task.done && !isUpcoming(task) && !isMissed(task)).length);
   let missedCount = $derived(tasks.filter(isMissed).length);
   let calendarMonthLabel = $derived(new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric' }).format(calendarMonth));
   let calendarDays = $derived(makeCalendarDays(calendarMonth));
 
-  function saveNote(event) {
+  async function persistTask(task) {
+    if (localOnly) return true;
+    if (!supabase || !activeUserId) return false;
+    const { error } = await supabase.from('tasks').upsert(taskToRow(task, activeUserId));
+    if (error) { authError = `Could not save task: ${error.message}`; return false; }
+    authError = '';
+    return true;
+  }
+
+  async function saveNote(event) {
     event.preventDefault();
     const title = modalTitle.trim();
     if (!title) return;
+    const previousTask = editingTaskId ? tasks.find((item) => item.id === editingTaskId) : null;
+    const task = editingTaskId
+      ? { ...previousTask, title, notes: modalNotes, dueAt: modalDue, color: modalColor, reminded: previousTask?.dueAt === modalDue ? previousTask.reminded : false }
+      : { id: crypto.randomUUID(), title, done: false, createdAt: Date.now(), dueAt: modalDue, reminded: false, notes: modalNotes, color: modalColor };
+    if (!task || !await persistTask(task)) return;
     if (editingTaskId) {
-      tasks = tasks.map((task) => task.id === editingTaskId
-        ? { ...task, title, notes: modalNotes, dueAt: modalDue, color: modalColor, reminded: task.dueAt === modalDue ? task.reminded : false }
-        : task);
+      tasks = tasks.map((item) => item.id === editingTaskId ? task : item);
     } else {
-      tasks = [{ id: crypto.randomUUID(), title, done: false, createdAt: Date.now(), dueAt: modalDue, reminded: false, notes: modalNotes, color: modalColor }, ...tasks];
+      tasks = [task, ...tasks];
     }
     filter = 'wall';
     closeEditor();
@@ -243,11 +331,19 @@
     return Number.isFinite(due.getTime()) && due.getTime() + gracePeriod <= currentTime;
   }
 
-  function toggleTask(id) {
-    tasks = tasks.map((task) => task.id === id ? { ...task, done: !task.done } : task);
+  async function toggleTask(id) {
+    const task = tasks.find((item) => item.id === id);
+    if (!task || !await persistTask({ ...task, done: !task.done })) return;
+    tasks = tasks.map((item) => item.id === id ? { ...item, done: !item.done } : item);
   }
 
-  function deleteTask(id) {
+  async function deleteTask(id) {
+    if (!localOnly) {
+      if (!supabase || !activeUserId) return;
+      const { error } = await supabase.from('tasks').delete().eq('id', id);
+      if (error) { authError = `Could not delete task: ${error.message}`; return; }
+      authError = '';
+    }
     tasks = tasks.filter((task) => task.id !== id);
     reminderQueue = reminderQueue.filter((task) => task.id !== id);
     if (editingTaskId === id) closeEditor();
@@ -264,10 +360,11 @@
     dismissReminder();
   }
 
-  function snoozeReminder() {
+  async function snoozeReminder() {
     const current = reminderQueue[0];
     if (!current) return;
     const snoozedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    if (!await persistTask({ ...current, dueAt: snoozedUntil, reminded: false })) return;
     tasks = tasks.map((task) => task.id === current.id ? { ...task, dueAt: snoozedUntil, reminded: false } : task);
     dismissReminder();
   }
@@ -290,6 +387,7 @@
     const ids = new Set(dueNow.map((task) => task.id));
     tasks = tasks.map((task) => ids.has(task.id) ? { ...task, reminded: true } : task);
     reminderQueue = [...reminderQueue, ...dueNow];
+    if (supabase && activeUserId && !localOnly) void supabase.from('tasks').update({ reminded: true }).in('id', [...ids]);
     if (reminderPermission === 'granted' && 'Notification' in window) {
       dueNow.forEach((task) => {
         const notification = new Notification('Task due now', { body: task.title, tag: `daylist-${task.id}` });
@@ -305,127 +403,112 @@
 </script>
 
 <svelte:head>
-  <title>Daylist — a little more focused</title>
+  <title>Jireh Todolist</title>
 </svelte:head>
 
 <svelte:window onkeydown={handleWindowKeydown} />
 
 <div class="page-backdrop theme-{theme}">
-  <div class="app-shell">
-    <aside class="sidebar">
-      <a class="brand" href="#home" aria-label="Daylist home">
-        <span class="brand-mark"><span></span><span></span><span></span></span>
-        <span>daylist<span class="brand-period">.</span></span>
-      </a>
+  <div class="app-shell redesign-shell">
+    <aside class="redesign-sidebar">
+      <div class="redesign-side-head"><a class="redesign-brand" href="#home"><span class="brand-symbol">J</span><span>Jireh Todolist</span></a><span class="redesign-menu-label">Menu</span><span class="redesign-menu-mark">☰</span></div>
+      <label class="redesign-search"><span>⌕</span><input aria-label="Search tasks" bind:value={searchQuery} placeholder="Search tasks" /></label>
 
-      <div class="menu-heading"><span>MENU</span><span class="menu-mark">☰</span></div>
-      <label class="search-box"><span>⌕</span><input aria-label="Search tasks" bind:value={searchQuery} placeholder="Search" /></label>
-
-      <div class="side-label">TASKS</div>
-      <nav class="nav-group" aria-label="Task views">
-        <button class="nav-item" class:selected={filter === 'upcoming'} aria-current={filter === 'upcoming' ? 'page' : undefined} onclick={() => filter = 'upcoming'}>
-          <span class="nav-icon">»</span><span>Upcoming</span><span class="nav-count">{upcomingCount}</span>
-        </button>
-        <button class="nav-item" class:selected={filter === 'today'} aria-current={filter === 'today' ? 'page' : undefined} onclick={() => filter = 'today'}>
-          <span class="nav-icon">▦</span><span>Today</span><span class="nav-count">{todayCount}</span>
-        </button>
-        <button class="nav-item" class:selected={filter === 'missed'} aria-current={filter === 'missed' ? 'page' : undefined} onclick={() => filter = 'missed'}>
-          <span class="nav-icon">!</span><span>Missed</span><span class="nav-count">{missedCount}</span>
-        </button>
-        <button class="nav-item" class:selected={filter === 'completed'} aria-current={filter === 'completed' ? 'page' : undefined} onclick={() => filter = 'completed'}>
-          <span class="nav-icon">✓</span><span>Completed</span><span class="nav-count">{completed}</span>
-        </button>
+      <div class="redesign-group-label">TASKS</div>
+      <nav class="redesign-nav" aria-label="Task views">
+        <button class="redesign-nav-item" class:active={filter === 'upcoming'} onclick={() => { filter = 'upcoming'; colorFilter = ''; }}><span>↗</span><span>Upcoming</span><b>{upcomingCount}</b></button>
+        <button class="redesign-nav-item" class:active={filter === 'today'} onclick={() => { filter = 'today'; colorFilter = ''; }}><span>▦</span><span>Today</span><b>{todayCount}</b></button>
+        <button class="redesign-nav-item" class:active={filter === 'calendar'} onclick={() => { filter = 'calendar'; colorFilter = ''; }}><span>▣</span><span>Calendar</span><b>{tasks.filter((task) => !task.done && task.dueAt).length}</b></button>
+        <button class="redesign-nav-item" class:active={filter === 'wall'} onclick={() => { filter = 'wall'; colorFilter = ''; }}><span>▤</span><span>Sticky Wall</span></button>
+        <button class="redesign-nav-item" class:active={filter === 'missed'} onclick={() => { filter = 'missed'; colorFilter = ''; }}><span>!</span><span>Missed</span><b>{missedCount}</b></button>
+        <button class="redesign-nav-item" class:active={filter === 'completed'} onclick={() => { filter = 'completed'; colorFilter = ''; }}><span>✓</span><span>Completed</span><b>{completed}</b></button>
       </nav>
 
-      <div class="side-label lists-label">VIEWS</div>
-      <button class="nav-item" class:selected={filter === 'wall'} aria-current={filter === 'wall' ? 'page' : undefined} onclick={() => filter = 'wall'}>
-        <span class="nav-icon">▤</span><span>To-do List</span>
-      </button>
+      <div class="redesign-group-heading"><span class="redesign-group-label">LISTS</span><button aria-label="Add a list" title="Lists are coming soon" disabled>＋</button></div>
+      <button class="redesign-list-item" class:active={filter === 'today'} onclick={() => { filter = 'today'; colorFilter = ''; }}><i></i><span>Personal</span><b>{todayCount}</b></button>
+      <button class="redesign-list-item" class:active={filter === 'upcoming'} onclick={() => { filter = 'upcoming'; colorFilter = ''; }}><i class="list-dot-blue"></i><span>Upcoming</span><b>{upcomingCount}</b></button>
 
-      <div class="side-label appearance-label">APPEARANCE</div>
-      <button class="nav-item theme-nav-item" aria-expanded={themePickerOpen} aria-controls="workspace-theme-picker" onclick={() => themePickerOpen = !themePickerOpen}>
-        <span class="nav-icon">◉</span><span>Theme</span><span class="theme-preview" style={`--swatch: ${selectedTheme.preview}`}></span><span class="theme-chevron">{themePickerOpen ? '⌃' : '⌄'}</span>
-      </button>
-      {#if themePickerOpen}
-        <div class="theme-picker" id="workspace-theme-picker" role="group" aria-label="Choose workspace theme color">
-          <span class="theme-picker-label">Workspace color</span>
-          <div class="theme-swatches">
-            {#each workspaceThemes as option}
-              <button type="button" class="theme-swatch" class:active={theme === option.id} style={`--swatch: ${option.preview}`} aria-label={`Use ${option.name} theme`} aria-pressed={theme === option.id} title={option.name} onclick={() => theme = option.id}></button>
-            {/each}
+      <div class="redesign-group-heading color-heading"><span class="redesign-group-label">PAPER COLORS</span></div>
+      <div class="redesign-color-tags">
+        {#each noteColors as color}
+          <button class:active={colorFilter === color} onclick={() => colorFilter = colorFilter === color ? '' : color} aria-pressed={colorFilter === color}>
+            <i class="color-dot swatch-{color}"></i><span>{color[0].toUpperCase() + color.slice(1)}</span><b>{tasks.filter((task) => (task.color || 'yellow') === color).length}</b>
+          </button>
+        {/each}
+      </div>
+
+      <div class="redesign-sidebar-footer">
+        <button class="redesign-footer-action" aria-expanded={themePickerOpen} aria-controls="workspace-theme-picker" onclick={() => themePickerOpen = !themePickerOpen}><span>⚙</span><span>Settings</span><span class="theme-preview" style={`--swatch: ${selectedTheme.preview}`}></span></button>
+        {#if themePickerOpen}
+          <div class="theme-picker redesign-theme-picker" id="workspace-theme-picker" role="group" aria-label="Choose workspace theme color">
+            <span class="theme-picker-label">Workspace color</span>
+            <div class="theme-swatches">
+              {#each workspaceThemes as option}
+                <button type="button" class="theme-swatch" class:active={theme === option.id} style={`--swatch: ${option.preview}`} aria-label={`Use ${option.name} theme`} aria-pressed={theme === option.id} title={option.name} onclick={() => theme = option.id}></button>
+              {/each}
+            </div><span class="theme-current">{selectedTheme.name}</span>
           </div>
-          <span class="theme-current">{selectedTheme.name}</span>
-        </div>
-      {/if}
-
-      <div class="sidebar-bottom">
-        <div class="focus-card">
-          <span class="focus-spark">✳</span>
-          <p>Make a little progress.<br />Then make a little more.</p>
-          <span class="focus-caption">A LITTLE REMINDER</span>
-        </div>
+        {/if}
+        {#if localOnly}<div class="sync-indicator"><span></span>Saved on this device</div>{:else if authUser}<div class="sync-indicator synced"><span></span>Synced with Supabase</div>{/if}
       </div>
     </aside>
 
-    <main id="home" class="main-area">
-      <header class="topbar">
-        <div class="breadcrumb">MY SPACE <span>/</span> <strong>{filter === 'wall' ? 'TO-DO LIST' : filter === 'today' ? 'TODAY' : filter === 'upcoming' ? 'UPCOMING' : filter === 'missed' ? 'MISSED' : 'COMPLETED'}</strong></div>
-        <div class="top-actions">
-          {#if reminderPermission === 'granted'}
-            <span class="reminder-status enabled" title="Browser reminders are enabled">◉ <span>Reminders on</span></span>
-          {:else if reminderPermission === 'denied'}
-            <span class="reminder-status" title="Allow notifications for this site in your browser settings">◉ <span>Notifications blocked</span></span>
-          {:else if reminderPermission === 'unsupported'}
-            <span class="reminder-status" title="This browser does not support notifications">◉ <span>Reminders unavailable</span></span>
+    <main id="home" class="redesign-main">
+      <header class="redesign-topbar"><div class="redesign-breadcrumb">MY SPACE <span>/</span> <strong>{viewTitle.toUpperCase()}</strong></div><div class="redesign-top-actions"><span class="redesign-date">{todayLabel}</span>{#if reminderPermission === 'default'}<button class="redesign-reminder-button" onclick={enableReminders}>Enable reminders</button>{:else if reminderPermission === 'granted'}<span class="reminder-status enabled">◉ Reminders on</span>{/if}<span class="redesign-avatar">K</span></div></header>
+      {#if authError}<div class="sync-alert redesign-alert" role="alert">{authError}</div>{/if}
+
+      <div class="redesign-workspace">
+        <section class="redesign-center" aria-label="Task list">
+          <div class="redesign-page-heading"><div><p>{new Intl.DateTimeFormat('en', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date())}</p><h1>{viewTitle}<span>{visibleTasks.length}</span></h1></div><button class="redesign-primary-add" type="button" onclick={openCreateNote}><span>＋</span> Add task</button></div>
+
+          {#if filter !== 'wall'}
+            <div class="redesign-list-caption"><span>{filter === 'today' ? 'Today’s focus' : filter === 'upcoming' ? 'Coming up' : filter === 'calendar' ? 'Scheduled tasks' : filter === 'missed' ? 'Needs attention' : 'Finished tasks'}</span><span>{visibleTasks.length} {visibleTasks.length === 1 ? 'task' : 'tasks'}</span></div>
+            <div class="redesign-task-list">
+              <button class="redesign-add-row" type="button" onclick={openCreateNote}><span>＋</span> Add new task</button>
+              {#if visibleTasks.length}
+                {#each visibleTasks as task (task.id)}
+                  <div class="redesign-task-row" class:selected={selectedTask?.id === task.id} class:completed-task={task.done}>
+                    <button class="redesign-checkbox" class:checked={task.done} aria-label={task.done ? `Mark ${task.title} as to do` : `Complete ${task.title}`} onclick={() => toggleTask(task.id)}>{#if task.done}✓{/if}</button>
+                    <button class="redesign-task-main" type="button" onclick={() => selectedTaskId = task.id}>
+                      <span class="redesign-task-title">{task.title}</span>
+                      {#if task.notes}<span class="redesign-task-summary">{task.notes}</span>{/if}
+                      <span class="redesign-task-meta">{#if task.dueAt}<span>▦ {formatDue(task.dueAt)}</span>{/if}{#if task.notes}<span>▤ Details</span>{/if}<i class="color-dot swatch-{noteColor(task, 0)}"></i></span>
+                    </button>
+                    <button class="redesign-row-edit" type="button" aria-label={`Edit ${task.title}`} onclick={(event) => openEditNote(task, event)}>›</button>
+                  </div>
+                {/each}
+              {:else}
+                <div class="redesign-empty"><span>✳</span><strong>{searchQuery.trim() ? 'No matching tasks' : filter === 'today' ? 'A clear day, for now' : 'Nothing here yet'}</strong><p>{searchQuery.trim() ? 'Try a different search.' : 'Add a task whenever you’re ready.'}</p><button type="button" onclick={openCreateNote}>＋ Add a task</button></div>
+              {/if}
+            </div>
           {:else}
-            <button class="reminder-button" onclick={enableReminders}>Enable reminders</button>
+            <div class="redesign-sticky-grid">
+              {#if visibleTasks.length}
+                {#each visibleTasks as task, index (task.id)}
+                  <article class="sticky-note redesign-sticky-note" class:note-yellow={noteColor(task, index) === 'yellow'} class:note-mint={noteColor(task, index) === 'mint'} class:note-rose={noteColor(task, index) === 'rose'} class:note-peach={noteColor(task, index) === 'peach'} class:note-sky={noteColor(task, index) === 'sky'} class:note-lilac={noteColor(task, index) === 'lilac'} class:done-note={task.done}>
+                    <div class="note-topline"><button class="check-button" class:checked={task.done} aria-label={task.done ? `Mark ${task.title} as to do` : `Complete ${task.title}`} onclick={() => toggleTask(task.id)}>{#if task.done}✓{/if}</button><button class="note-edit" aria-label={`Edit ${task.title}`} onclick={(event) => openEditNote(task, event)}>✎</button></div>
+                    <button class="note-title" onclick={() => selectedTaskId = task.id}>{task.title}</button><p class="note-body">{task.notes || 'Add details from the task panel.'}</p><div class="note-due">◷ <span>{task.dueAt ? formatDue(task.dueAt) : 'No due date'}</span></div>
+                  </article>
+                {/each}
+              {:else}<div class="redesign-empty"><span>▤</span><strong>Your wall is clear</strong><p>Add a note to get started.</p><button type="button" onclick={openCreateNote}>＋ Add a task</button></div>{/if}
+            </div>
           {/if}
-          <span class="date-chip"><span class="calendar-icon">▦</span>{todayLabel}</span>
-        </div>
-      </header>
+        </section>
 
-      <section class="content">
-        <div class="page-heading">
-          <div><div class="eyebrow"><span class="sun-icon">✳</span> YOUR TASKS, ALL IN ONE PLACE</div><h1>{filter === 'upcoming' ? 'Upcoming' : filter === 'today' ? 'Today' : filter === 'missed' ? 'Missed' : filter === 'completed' ? 'Completed' : 'To-do List'} <span class="heading-count">{visibleTasks.length}</span></h1></div>
-          <div class="heading-date">{todayLabel}</div>
-        </div>
-
-        <div class="list-heading"><div><h2>{filter === 'wall' ? 'Your tasks' : filter === 'upcoming' ? 'Coming up' : filter === 'today' ? 'For today' : filter === 'missed' ? 'Missed tasks' : 'Completed tasks'}</h2><span class="task-total">{remaining} {remaining === 1 ? 'task' : 'tasks'} to go</span></div>
-          <div class="filters" aria-label="Filter tasks">
-            <button class:active={filter === 'wall'} aria-pressed={filter === 'wall'} onclick={() => filter = 'wall'}>Open <span>{remaining}</span></button>
-            <button class:active={filter === 'today'} aria-pressed={filter === 'today'} onclick={() => filter = 'today'}>To do <span>{remaining}</span></button>
-            <button class:active={filter === 'completed'} aria-pressed={filter === 'completed'} onclick={() => filter = 'completed'}>Done <span>{completed}</span></button>
-          </div>
-        </div>
-
-        <div class="sticky-grid">
-          {#if visibleTasks.length}
-            {#each visibleTasks as task, index (task.id)}
-              <article class="sticky-note" class:note-yellow={noteColor(task, index) === 'yellow'} class:note-mint={noteColor(task, index) === 'mint'} class:note-rose={noteColor(task, index) === 'rose'} class:note-peach={noteColor(task, index) === 'peach'} class:note-sky={noteColor(task, index) === 'sky'} class:note-lilac={noteColor(task, index) === 'lilac'} class:done-note={task.done}>
-                <div class="note-topline">
-                  <button class="check-button" class:checked={task.done} aria-label={task.done ? `Mark ${task.title} as to do` : `Complete ${task.title}`} onclick={() => toggleTask(task.id)}>{#if task.done}<span>✓</span>{/if}</button>
-                  <button class="note-edit" aria-label={`Edit ${task.title}`} title="Edit task" onclick={(event) => openEditNote(task, event)}>✎</button>
-                  <button class="delete-button" aria-label={`Delete ${task.title}`} onclick={() => deleteTask(task.id)}>×</button>
-                </div>
-                <button class="note-title" class:crossed-out={task.done} onclick={(event) => openEditNote(task, event)}>{task.title}</button>
-                <p class="note-body">{task.notes || 'Add a few details to this task...'}</p>
-                <div class="note-due">◷ <span>{task.dueAt ? formatDue(task.dueAt) : 'Add due date & time'}</span></div>
-              </article>
-            {/each}
-          {:else if searchQuery.trim()}
-            <div class="empty-state"><div class="empty-icon">⌕</div><strong>No matching tasks.</strong><span>Try another search.</span></div>
+        <aside class="redesign-detail" aria-label="Task details">
+          {#if selectedTask}
+            <div class="redesign-detail-head"><span>TASK DETAILS</span><button type="button" aria-label="Edit task" onclick={(event) => openEditNote(selectedTask, event)}>✎</button></div>
+            <div class="redesign-detail-title"><span class="detail-check" class:checked={selectedTask.done}>{selectedTask.done ? '✓' : ''}</span><h2>{selectedTask.title}</h2></div>
+            <div class="redesign-detail-section"><span class="detail-section-label">DESCRIPTION</span><p class:muted={!selectedTask.notes}>{selectedTask.notes || 'Add a description to keep useful details with this task.'}</p></div>
+            <div class="redesign-detail-fields"><div><span>List</span><strong><i class="list-dot"></i> Personal</strong></div><div><span>Due date</span><strong>{selectedTask.dueAt ? formatDue(selectedTask.dueAt) : 'Not set'}</strong></div><div><span>Paper</span><strong><i class="color-dot swatch-{noteColor(selectedTask, 0)}"></i>{noteColor(selectedTask, 0)}</strong></div><div><span>Status</span><strong>{selectedTask.done ? 'Completed' : 'To do'}</strong></div></div>
+            <div class="redesign-detail-spacer"></div>
+            <div class="redesign-detail-actions"><button type="button" class="detail-delete" onclick={() => deleteTask(selectedTask.id)}>Delete task</button><button type="button" class="detail-save" onclick={(event) => openEditNote(selectedTask, event)}>Edit task</button></div>
           {:else}
-            <div class="empty-state"><div class="empty-icon">{filter === 'wall' ? '✓' : filter === 'missed' ? '!' : '✳'}</div><strong>{filter === 'wall' ? 'You’re all caught up.' : filter === 'upcoming' ? 'Nothing coming up yet.' : filter === 'missed' ? 'No missed tasks.' : filter === 'completed' ? 'No completed tasks yet.' : 'Nothing planned for today.'}</strong><span>{filter === 'wall' ? 'Completed tasks are in Completed.' : filter === 'upcoming' ? 'Add a future due date to a task.' : filter === 'missed' ? 'Tasks past their due date will show here.' : filter === 'completed' ? 'Finished tasks will collect here.' : 'Add a task or choose another view.'}</span></div>
+            <div class="redesign-detail-empty"><span>↖</span><strong>Select a task</strong><p>Choose a task to see its details here.</p></div>
           {/if}
-          <button class="add-note-tile" type="button" onclick={openCreateNote} aria-label="Add a new task">
-            <div class="new-note-icon">+</div>
-            <span class="add-note-label">Add a new task...</span>
-          </button>
-        </div>
-        <footer class="content-footer"><span>MADE FOR A CALMER KIND OF PRODUCTIVITY</span><span>ONE THING AT A TIME <b>✳</b></span></footer>
-      </section>
+        </aside>
+      </div>
     </main>
-
   </div>
   {#if modalOpen}
     <div class="modal-backdrop">
